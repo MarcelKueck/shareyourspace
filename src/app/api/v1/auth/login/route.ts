@@ -1,17 +1,19 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import bcrypt from 'bcryptjs';
 import { signJWT } from '@/lib/auth/jwt';
+import { csrfProtection } from '@/lib/auth/csrf';
 import { z } from 'zod';
+import { UserType } from '@/models/user';
 
 // Validation schema
 const loginSchema = z.object({
   email: z.string().email('Invalid email address'),
-  password: z.string().min(8, 'Password must be at least 8 characters'),
+  password: z.string().min(1, 'Password is required'),
   rememberMe: z.boolean().optional(),
 });
 
-export async function POST(request: Request) {
+async function handler(request: NextRequest) {
   try {
     // Parse and validate request body
     const body = await request.json();
@@ -28,29 +30,45 @@ export async function POST(request: Request) {
 
     // In a real app, you would look up the user in your database
     // This is just a placeholder for demonstration
-    const user = { id: '123', email, password: 'hashed_password', userType: 'corporate' };
+    // TODO: Replace with actual database lookup
+    const user = {
+      id: '123',
+      email,
+      password: await bcrypt.hash('password123', 10), // Hashed password
+      userType: UserType.CORPORATE,
+      firstName: 'John',
+      lastName: 'Doe',
+      companyId: 'company-123',
+    };
 
     // Check if user exists
     if (!user) {
+      // Use a generic error message to prevent user enumeration
       return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
     }
 
     // Verify password
-    // In a real app, you would compare with bcrypt
-    // Example: const isValid = await bcrypt.compare(password, user.password);
-    const isValid = true; // Placeholder
+    const isValid = await bcrypt.compare(password, user.password);
 
     if (!isValid) {
+      // Add a small delay to prevent timing attacks
+      await new Promise((resolve) => setTimeout(resolve, 500 + Math.random() * 500));
       return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
     }
 
-    // Create JWT token
+    // Create JWT token with user information
     const token = await signJWT(
-      { id: user.id, email: user.email, userType: user.userType },
+      {
+        id: user.id,
+        email: user.email,
+        userType: user.userType,
+        name: `${user.firstName} ${user.lastName}`,
+        companyId: user.companyId,
+      },
       rememberMe ? '30d' : '7d'
     );
 
-    // Set cookie
+    // Set the token as an HTTP-only cookie
     const cookieOptions = {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -67,10 +85,16 @@ export async function POST(request: Request) {
         id: user.id,
         email: user.email,
         userType: user.userType,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        companyId: user.companyId,
       },
+      token, // Include token in response for client-side storage if needed
     });
   } catch (error) {
     console.error('Login error:', error);
-    return NextResponse.json({ error: 'Something went wrong' }, { status: 500 });
+    return NextResponse.json({ error: 'Authentication failed' }, { status: 500 });
   }
 }
+
+export const POST = csrfProtection(handler);

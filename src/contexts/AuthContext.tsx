@@ -1,10 +1,28 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { useRouter } from 'next/router';
+import { useRouter } from 'next/navigation';
 import { User, UserType } from '@/models/user';
-import apiClient from '@/lib/api/api-client';
 import { getCookie, setCookie, deleteCookie } from 'cookies-next';
+import { get, post } from '@/lib/api/api-client';
 
-interface RegistrationData {
+interface AuthState {
+  user: User | null;
+  userType: UserType | null;
+  isAuthenticated: boolean;
+  isLoading: boolean;
+  error: Error | null;
+}
+
+interface AuthContextType extends AuthState {
+  login: (email: string, password: string, rememberMe?: boolean) => Promise<void>;
+  logout: () => Promise<void>;
+  register: (userData: RegistrationData) => Promise<void>;
+  resetPassword: (email: string) => Promise<void>;
+  updatePassword: (token: string, newPassword: string) => Promise<void>;
+  clearError: () => void;
+  refreshToken: () => Promise<boolean>;
+}
+
+export interface RegistrationData {
   email: string;
   password: string;
   firstName: string;
@@ -14,170 +32,284 @@ interface RegistrationData {
   [key: string]: any;
 }
 
-interface AuthContextType {
-  user: User | null;
-  isLoading: boolean;
-  error: Error | null;
-  login: (email: string, password: string, rememberMe?: boolean) => Promise<void>;
-  logout: () => Promise<void>;
-  register: (userData: RegistrationData) => Promise<void>;
-  resetPassword: (email: string) => Promise<void>;
-  updatePassword: (token: string, newPassword: string) => Promise<void>;
-  isAuthenticated: boolean;
-  userType: UserType | null;
-  clearError: () => void;
-}
-
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+// Token refresh interval in milliseconds (15 minutes)
+const TOKEN_REFRESH_INTERVAL = 15 * 60 * 1000;
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [error, setError] = useState<Error | null>(null);
+  const [state, setState] = useState<AuthState>({
+    user: null,
+    userType: null,
+    isAuthenticated: false,
+    isLoading: true,
+    error: null,
+  });
+
   const router = useRouter();
 
   // Check if user is authenticated on mount
   useEffect(() => {
     const initAuth = async () => {
       try {
-        setIsLoading(true);
+        setState((prev) => ({ ...prev, isLoading: true }));
         const token = getCookie('auth-token');
 
         if (token) {
-          const response = await apiClient.get<{ user: User }>('/api/v1/users/me');
-          setUser(response.data.user);
+          // Verify the token and get user data
+          const csrfToken = getCookie('csrf-token');
+
+          const response = await get<{ user: User }>('/api/v1/users/me', {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'X-CSRF-Token': csrfToken || '',
+            },
+          });
+
+          setState({
+            user: response.user,
+            userType: response.user.userType,
+            isAuthenticated: true,
+            isLoading: false,
+            error: null,
+          });
+        } else {
+          setState({
+            user: null,
+            userType: null,
+            isAuthenticated: false,
+            isLoading: false,
+            error: null,
+          });
         }
       } catch (err) {
-        setError(err as Error);
+        console.error('Authentication initialization error:', err);
+        setState({
+          user: null,
+          userType: null,
+          isAuthenticated: false,
+          isLoading: false,
+          error: err as Error,
+        });
         deleteCookie('auth-token');
-      } finally {
-        setIsLoading(false);
       }
     };
 
     initAuth();
   }, []);
 
-  const login = async (email: string, password: string, rememberMe = false) => {
+  // Set up token refresh interval
+  useEffect(() => {
+    if (!state.isAuthenticated) return;
+
+    const intervalId = setInterval(() => {
+      refreshToken();
+    }, TOKEN_REFRESH_INTERVAL);
+
+    return () => clearInterval(intervalId);
+  }, [state.isAuthenticated]);
+
+  const refreshToken = async (): Promise<boolean> => {
     try {
-      setIsLoading(true);
-      setError(null);
-
-      const response = await apiClient.post<{ user: User; token: string }>('/api/v1/auth/login', {
-        email,
-        password,
-        rememberMe,
-      });
-
-      setUser(response.data.user);
+      const response = await post<{ token: string }>('/api/v1/auth/refresh-token');
 
       // Token is set via HTTP-only cookie in the server response
-      // This is just for redundancy or client-side usage if needed
-      setCookie('auth-token', response.data.token, {
-        maxAge: rememberMe ? 30 * 24 * 60 * 60 : 7 * 24 * 60 * 60,
+      // This is just for redundancy
+      if (response.token) {
+        setCookie('auth-token', response.token, {
+          maxAge: 7 * 24 * 60 * 60, // 7 days
+          path: '/',
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'strict',
+        });
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error('Token refresh failed:', err);
+      // If refresh fails, log the user out
+      await logout();
+      return false;
+    }
+  };
+
+  const login = async (email: string, password: string, rememberMe = false) => {
+    try {
+      setState((prev) => ({ ...prev, isLoading: true, error: null }));
+
+      // Get CSRF token first
+      const csrfResponse = await get<{ csrfToken: string }>('/api/v1/auth/csrf');
+      setCookie('csrf-token', csrfResponse.csrfToken, {
+        maxAge: 60 * 60, // 1 hour
         path: '/',
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'strict',
       });
 
+      const response = await post<{ user: User; token: string }>(
+        '/api/v1/auth/login',
+        {
+          email,
+          password,
+          rememberMe,
+        },
+        {
+          headers: {
+            'X-CSRF-Token': csrfResponse.csrfToken,
+          },
+        }
+      );
+
+      // Update state with user data
+      setState({
+        user: response.user,
+        userType: response.user.userType,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      });
+
       // Redirect based on user type
-      if (response.data.user.userType === UserType.CORPORATE) {
+      if (response.user.userType === UserType.CORPORATE) {
         router.push('/dashboard/corporate');
       } else {
         router.push('/dashboard/startup');
       }
     } catch (err) {
-      setError(err as Error);
+      setState((prev) => ({ ...prev, isLoading: false, error: err as Error }));
       throw err;
-    } finally {
-      setIsLoading(false);
     }
   };
 
   const logout = async () => {
     try {
-      setIsLoading(true);
-      await apiClient.post('/api/v1/auth/logout');
-      setUser(null);
+      setState((prev) => ({ ...prev, isLoading: true }));
+
+      // Get CSRF token
+      const csrfToken = getCookie('csrf-token');
+
+      await post(
+        '/api/v1/auth/logout',
+        {},
+        {
+          headers: {
+            'X-CSRF-Token': csrfToken || '',
+          },
+        }
+      );
+
+      setState({
+        user: null,
+        userType: null,
+        isAuthenticated: false,
+        isLoading: false,
+        error: null,
+      });
+
+      // Clear cookies
       deleteCookie('auth-token');
+      deleteCookie('csrf-token');
+
       router.push('/auth/login');
     } catch (err) {
-      setError(err as Error);
-    } finally {
-      setIsLoading(false);
+      setState((prev) => ({ ...prev, isLoading: false, error: err as Error }));
     }
   };
 
   const register = async (userData: RegistrationData) => {
     try {
-      setIsLoading(true);
-      setError(null);
+      setState((prev) => ({ ...prev, isLoading: true, error: null }));
 
-      const response = await apiClient.post<{ user: User; token: string }>(
+      // Get CSRF token first
+      const csrfResponse = await get<{ csrfToken: string }>('/api/v1/auth/csrf');
+
+      const response = await post<{ user: User; token: string }>(
         '/api/v1/auth/register',
-        userData
+        userData,
+        {
+          headers: {
+            'X-CSRF-Token': csrfResponse.csrfToken,
+          },
+        }
       );
 
-      setUser(response.data.user);
-      setCookie('auth-token', response.data.token, {
-        maxAge: 7 * 24 * 60 * 60,
-        path: '/',
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
+      setState({
+        user: response.user,
+        userType: response.user.userType,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
       });
 
       // Redirect to email verification page
       router.push('/auth/verify-email');
     } catch (err) {
-      setError(err as Error);
+      setState((prev) => ({ ...prev, isLoading: false, error: err as Error }));
       throw err;
-    } finally {
-      setIsLoading(false);
     }
   };
 
   const resetPassword = async (email: string) => {
     try {
-      setIsLoading(true);
-      setError(null);
-      await apiClient.post('/api/v1/auth/forgot-password', { email });
+      setState((prev) => ({ ...prev, isLoading: true, error: null }));
+
+      // Get CSRF token first
+      const csrfResponse = await get<{ csrfToken: string }>('/api/v1/auth/csrf');
+
+      await post(
+        '/api/v1/auth/forgot-password',
+        { email },
+        {
+          headers: {
+            'X-CSRF-Token': csrfResponse.csrfToken,
+          },
+        }
+      );
+
+      setState((prev) => ({ ...prev, isLoading: false }));
     } catch (err) {
-      setError(err as Error);
+      setState((prev) => ({ ...prev, isLoading: false, error: err as Error }));
       throw err;
-    } finally {
-      setIsLoading(false);
     }
   };
 
   const updatePassword = async (token: string, newPassword: string) => {
     try {
-      setIsLoading(true);
-      setError(null);
-      await apiClient.post('/api/v1/auth/reset-password', { token, newPassword });
+      setState((prev) => ({ ...prev, isLoading: true, error: null }));
+
+      // Get CSRF token first
+      const csrfResponse = await get<{ csrfToken: string }>('/api/v1/auth/csrf');
+
+      await post(
+        '/api/v1/auth/reset-password',
+        { token, newPassword },
+        {
+          headers: {
+            'X-CSRF-Token': csrfResponse.csrfToken,
+          },
+        }
+      );
+
+      setState((prev) => ({ ...prev, isLoading: false }));
     } catch (err) {
-      setError(err as Error);
+      setState((prev) => ({ ...prev, isLoading: false, error: err as Error }));
       throw err;
-    } finally {
-      setIsLoading(false);
     }
   };
 
   const clearError = () => {
-    setError(null);
+    setState((prev) => ({ ...prev, error: null }));
   };
 
   const value = {
-    user,
-    isLoading,
-    error,
+    ...state,
     login,
     logout,
     register,
     resetPassword,
     updatePassword,
-    isAuthenticated: !!user,
-    userType: user?.userType || null,
     clearError,
+    refreshToken,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
